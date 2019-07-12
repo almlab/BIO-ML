@@ -1,0 +1,36 @@
+#############################################
+############ Sanger 16S analysis ############
+#############################################
+
+### Reconstruction of the 16S phylogenetic tree
+
+#Taxonomy calling from all isolate 16S sanger sequences was done using the RDP classifier:
+https://rdp.cme.msu.edu/classifier/classifier.jsp
+
+#All Sanger 16S sequences and RDP taxonomies are available in Supplementary Table 1.
+
+#Sanger sequences were aligned with Mafft:
+mafft sanger16S.fas > sanger16S.aligned.fas
+
+#Positions with more than 80% of gaps were removed from the alignment:
+trimal -in sanger16S.aligned.fas -out sanger16S.aligned.trimmed.fas -gt 0.8
+
+#RDP taxonomies were used to create a file containing taxonomic constraints for constraining the exploration of the tree space in FastTree. File is sanger16S.constraints.txt. See FastTree manual: http://www.microbesonline.org/fasttree/
+
+#The tree is reconstructed using FastTree:
+FastTree -nt -gtr -constraints sanger16S.constraints.txt sanger16S.aligned.trimmed.fas > sanger16S.aligned.trimmed.tree
+
+
+### Comparison of our library of isolates with the most wanted OTUs published by the HMP:
+
+#Here, we blast the most wanted HMP otu reads against our 16S sequences to check which ones we have. We'll count all isolates that have similarity higher than 97% with a least 1 most wanted otu.
+As some MW otu reads are V1V3, and not V3V5, and ss our sanger sequences start at V4, we cannot detect any significant similarity for about half of the most wanted reads. So we also check against the 16s sequences from our assembly genomes. It's a conservative approach, and we probably miss some otus.
+
+#We use blast to compare 16S sequences:
+makeblastdb -in sanger16S.fas -dbtype nucl
+makeblastdb -in wgs16S.fas -dbtype nucl
+blastn -db sanger16S.fas -query MiscellaneousFiles/most_wanted_isolate_HMP_stool_16S.fas -out results_blast_bestHistForEachMostWanted_Sanger.txt -outfmt 6 -evalue 0.0001 -max_target_seqs 1
+blastn -db wgs16S.fas -query MiscellaneousFiles/most_wanted_isolate_HMP_stool_16S.fas -out results_blast_bestHistForEachMostWanted_WGS.txt -outfmt 6 -evalue 0.0001 -max_target_seqs 1
+
+#Then we parse the result files to count how many most wanted otus are found in our collection (either 16S sanger or 16S from WGS).
+

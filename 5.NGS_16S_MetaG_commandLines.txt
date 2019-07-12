@@ -1,0 +1,91 @@
+#############################################
+########## Processing of 16S data ###########
+#############################################
+
+#16S data were processed in R, using the dada2 package.
+
+source("http://bioconductor.org/biocLite.R")
+biocLite(suppressUpdates = FALSE)
+biocLite("dada2")
+library(dada2)
+packageVersion("dada2")
+[1] ‘1.6.0’
+path <- "demulti_fastqs_BIOML"
+filtpath <- file.path(path,"filtered")
+fns <- list.files(path,pattern="fastq") filterAndTrim(file.path(path,fns),file.path(filtpath,fns),truncLen=240,maxEE=1,truncQ=11,rm.phix=TRUE,compress=TRUE,verbose=TRUE,multithread=TRUE)
+filts <- list.files(filtpath, pattern="fastq", full.names=TRUE)
+sample.names <- sapply(strsplit(basename(filts), ".fa"), `[`, 1)  
+names(filts) <- sample.names
+set.seed(100)
+err <- learnErrors(filts, nreads = 1e6, multithread=TRUE, randomize=TRUE)
+dds <- vector("list", length(sample.names))
+names(dds) <- sample.names
+for(sam in sample.names) {
+   cat("Processing:", sam, "\n")
+   derep <- derepFastq(filts[[sam]])
+   dds[[sam]] <- dada(derep, err=err, multithread=TRUE)
+}
+
+seqtab <- makeSequenceTable(dds)
+saveRDS(seqtab, "BIOML_16s_seqtab.rds")
+seqtab_nochimeras <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE)
+seqs <- colnames(seqtab)
+#Note: here, we first assign taxonomies using Silva, but we then used RDP for consistency with the taxonomies called for sanger sequences of isolate genomes.
+tax <- assignTaxonomy(seqtab_nochimeras, "silva_nr_v128_train_set.fa.gz", multithread=TRUE)
+write.table(cbind(t(seqtab_nochimeras),tax),"BIOML_16S_otu_table_dada2_w_tax.txt",quote=FALSE)
+write.table(t(seqtab_nochimeras),"BIOML_16S_otu_table_dada2.txt",quote=FALSE)
+
+
+#############################################
+###### Processing of Metagenomics data ######
+#############################################
+
+### Quality filtering
+* trim low quality reads
+* remove PCR duplicates
+* remove reads mapping the human genome
+* remove adapters
+
+human_ref=/dbs/human/hg18.fa # human reference genomes
+trimmomatic PE sample.1.fq.gz sample.2.fq.gz sample_P.1.fq.gz sample_U.1.fq.gz sample_P.2.fq.gz sample_U.2.fq.gz LEADING:20 TRAILING:20 MINLEN:50
+pigz -d ${sample}_P.1.fq.gz
+pigz -d ${sample}_P.2.fq.gz
+fastuniq -i <(printf "sample_P.1.fq\nsample_P.2.fq\n") -t q -o sample_1.fq -p sample_2.fq
+bwa mem ${human_ref} sample_1.fq sample_2.fq|samtools fastq -f 13 -n -1 sample.1.fq -2 sample.2.fq -
+trim_galore --paired --nextera --stringency 3 sample.1.fq sample.2.fq --gzip
+
+### Assembly and gene annotation  
+* metagnomic assembly
+* structural gene prediction 
+
+#Assembly
+spades.py --meta -t 8 -1 sample.1.fq -2 sample.2.fq -o sample
+
+#Gene prediction
+prodigal -q -m -p meta -a sample.genes.faa -d sample.genes.fna -f gff -o sample.gff -i sample/scaffolds.fasta
+
+#We create a non-redundant gene reference, and we annotate them with COG terms 
+We first rename all the gene.fna samples and merge them into one file `cds.nt`
+* create non-redundant list of nucleotide sequences of cds
+* build a bowtie database for those sequences
+
+cd-hit-est -d 0 -n 10 -l 100 -p 1 -G 0 -c 0.95 -aS 0.8 -M 0 -T 0 -i cds.nt -o cds.nr.nt
+bowtie2-build cds.nr.nt cds.nr.nt
+
+#We download the COG database and scripts from this link: https://github.com/aleimba/bac-genomics-scripts/tree/master/cdd2cog
+
+#We extract the corresponding aa sequences `cds.nr.aa`
+* annotate all the non redundant nr
+
+cogfolder=path_to_cog_folder 
+rpsblast -query cds.nr.aa -db ${cogfolder}/Cog -out sample.out -evalue 1e-3 -outfmt 6 
+cdd2cog.pl -r CDSRef.out -c ${cogfolder}/cddid.tbl -f ${cogfolder}/fun.txt -w ${cogfolder}/whog -o CDSRef
+
+# We now estimate the abundance of gene references in each sample:
+* align reads 
+* estimate the abundance
+
+#We align reads and then estimate abundances:
+bowtie2 --no-unal -x cds.nr.nt -1 sample.1.fq -2 sample.2.fq -S sample.sam;
+samtools view -hubS sample.sam |samtools sort 1>sample.bam;
+gen_contig_cov_per_bam_table.py ${ref_genome} sample.bam sample.table

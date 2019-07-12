@@ -1,0 +1,112 @@
+#############################################
+############### SNP calling  ################
+#############################################
+
+### Building and indexing the reference genome:
+
+bowtie2-build reference.fna reference
+java -jar picard.jar CreateSequenceDictionary R=reference.fna O=reference.fna.dict
+samtools faidx reference.fna
+
+### Alignment of reads and quality filtering of alignments:
+
+#First we align reads against the reference genome:
+bowtie2 -1 genome_R1.fastq -2 genome_R2.fastq -x reference.fna -S genome.reads.aligned.sam --un-conc genome.unaligned.fastq --n-ceil 0,0.01 --dovetail --no-mixed --very-sensitive -X 2000 > bowtie2_output
+samtools view -b -o genome.reads.aligned.bam genome.reads.aligned.sam
+samtools sort -o genome.reads.aligned.sorted.bam genome.reads.aligned.bam
+
+#We remove duplicates and we re-align:
+java -jar picard.jar MarkDuplicates I=genome.reads.aligned.sorted.bam O=genome.reads.aligned.sorted.rmdup.bam M=duplicateMatrix REMOVE_DUPLICATES=true 
+java -jar picard.jar AddOrReplaceReadGroups I=genome.reads.aligned.sorted.rmdup.bam O=genome.reads.aligned.sorted.rmdup.addgp.bam RGLB=temp RGPL=illumina RGPU=temp RGSM=genome
+samtools index genome.reads.aligned.sorted.rmdup.addgp.bam
+
+#Indel realignment:
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T RealignerTargetCreator -R reference.fna -I genome.reads.aligned.sorted.rmdup.addgp.bam -o genome.reads.aligned.sorted.rmdup.addgp.intervals
+java -Xmx4g -jar GATK3.7/GenomeAnalysisTK.jar -T IndelRealigner -I genome.reads.aligned.sorted.rmdup.addgp.bam -R reference.fna -targetIntervals genome.reads.aligned.sorted.rmdup.addgp.intervals -o genome.reads.realigned.bam
+
+### We call variants on each individual samples. Then we'll call for variants across all samples.
+
+##STEP 1 - First round of variant calling (both SNPs and indels):
+#We first call for variants using GATK functions, without --emitRefConfidence:  
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T HaplotypeCaller -R reference.fna -I genome.reads.realigned.bam --sample_ploidy 1 -mmq 40 --genotyping_mode DISCOVERY -o genome.raw_variants_step1.vcf 
+
+#Select and filter snps:
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T SelectVariants -R reference.fna -V genome.raw_variants_step1.vcf -selectType SNP -o genome.variants.snps_step1.vcf
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T VariantFiltration -R reference.fna -V genome.variants.snps_step1.vcf --clusterWindowSize 10 --clusterSize 3 --filterName \"SNPFiltering\" --filterExpression \"QD < 2.0 || FS > 60.0 || MQ < 40.0 || (vc.hasAttribute(\"MQRankSum\") && MQRankSum < -4.0) || (vc.hasAttribute(\"ReadPosRankSum\") && ReadPosRankSum < -2.0) || (vc.hasAttribute(\"BaseQRankSum\") && BaseQRankSum < -2.0) || (vc.hasAttribute(\"ClippingRankSum\") && ClippingRankSum < -2.0) || SOR > 4.0\" -o genome.variants.snps.filtered_step1.vcf
+
+#Select and filter indels:
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T SelectVariants -R reference.fna -V genome.raw_variants_step1.vcf -selectType INDEL -o genome.variants.indels_step1.vcf
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T VariantFiltration -R reference.fna -V genome.variants.indels_step1.vcf --filterName \"INDELFiltering\" --filterExpression \"QD < 2.0 || FS > 200.0 || ReadPosRankSum < -10.0 || SOR > 4.0\" -o genome.variants.indels.filtered_step1.vcf
+
+#Base Quality Score Recalibration (BQSR) #step 1
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T BaseRecalibrator -R reference.fna -I genome.reads.realigned.bam -knownSites genome.variants.snps.filtered_step1.vcf -knownSites genome.variants.indels.filtered_step1.vcf -o recal_data_step1.table
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T BaseRecalibrator -R reference.fna -I genome.reads.realigned.bam -knownSites genome.variants.snps.filtered_step1.vcf -knownSites genome.variants.indels.filtered_step1.vcf -BQSR recal_data_step1.table -o post_recal_data_step1.table
+
+#Analyze Covariates 
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T AnalyzeCovariates -R reference.fna -before recal_data_step1.table -after post_recal_data_step1.table -plots recalibration_plots_step1.pdf 
+
+#Apply BQSR 
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T PrintReads -R reference.fna -I genome.reads.realigned.bam -BQSR recal_data_step1.table -o genome.recal_reads_step1.bam
+  
+##STEP 2
+#variant calling, without --emitRefConfidence:
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T HaplotypeCaller -R reference.fna -I genome.recal_reads_step1.bam --sample_ploidy 1 -mmq 40 --genotyping_mode DISCOVERY -o genome.raw_variants_step2.vcf 
+
+#Select and filter snps:
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T SelectVariants -R reference.fna -V genome.raw_variants_step2.vcf -selectType SNP -o genome.variants.snps_step2.vcf
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T VariantFiltration -R reference.fna -V genome.variants.snps_step2.vcf --clusterWindowSize 10 --clusterSize 3 --filterName \"SNPFiltering\" --filterExpression \"QD < 2.0 || FS > 60.0 || MQ < 40.0 || (vc.hasAttribute(\"MQRankSum\") && MQRankSum < -4.0) || (vc.hasAttribute(\"ReadPosRankSum\") && ReadPosRankSum < -2.0) || (vc.hasAttribute(\"BaseQRankSum\") && BaseQRankSum < -2.0) || (vc.hasAttribute(\"ClippingRankSum\") && ClippingRankSum < -2.0) || SOR > 4.0\" -o genome.variants.snps.filtered_step2.vcf 
+
+#Select and filter indels:
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T SelectVariants -R reference.fna -V genome.raw_variants_step2.vcf -selectType INDEL -o genome.variants.indels_step2.vcf" >> snpCalling_step1_genome.sbatch 
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T VariantFiltration -R reference.fna -V genome.variants.indels_step2.vcf --filterName \"INDELFiltering\" --filterExpression \"QD < 2.0 || FS > 200.0 || ReadPosRankSum < -10.0 || SOR > 4.0\" -o genome.variants.indels.filtered_step2.vcf 
+
+#Base Quality Score Recalibration (BQSR) #step 2
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T BaseRecalibrator -R reference.fna -I genome.recal_reads_step1.bam -knownSites genome.variants.snps.filtered_step2.vcf -knownSites genome.variants.indels.filtered_step2.vcf -o recal_data_step2.table 
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T BaseRecalibrator -R reference.fna -I genome.recal_reads_step1.bam -knownSites genome.variants.snps.filtered_step2.vcf -knownSites genome.variants.indels.filtered_step2.vcf -BQSR recal_data_step2.table -o post_recal_data_step2.table
+
+#Analyze Covariates 
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T AnalyzeCovariates -R reference.fna -before recal_data_step2.table -after post_recal_data_step2.table -plots recalibration_plots_step2.pdf
+
+#Apply BQSR 
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T PrintReads -R reference.fna -I genome.recal_reads_step1.bam -BQSR recal_data_step2.table -o genome.recal_reads_step2.bam
+  
+##STEP 3; last call of HaplotypeCaller, we use --emitRefConfidence for future merging with GenotypeGVCFs
+#variant calling, WITH --emitRefConfidence:
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T HaplotypeCaller -R reference.fna -I genome.recal_reads_step2.bam --sample_ploidy 1 -mmq 40 --genotyping_mode DISCOVERY --emitRefConfidence GVCF -o genome.raw_variants_step3.g.vcf
+
+
+### Now we run the joint genotyping:
+
+mkdir JointGenotyping
+cd JointGenotyping
+ls *raw_variants_step3.g.vcf > listOfindividualGCVFfiles.list
+
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T CombineGVCFs -R reference.fna --variant listOfindividualGCVFfiles.list -o all_samples_raw_variants.g.vcf
+  
+#Joint genotyping:
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T GenotypeGVCFs -R reference.fna --variant all_samples_raw_variants.g.vcf -newQual --standard_min_confidence_threshold_for_calling 30 -o all_samples_genotypes.vcf
+  
+#Select and filter snps:
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T SelectVariants -R reference.fna -V all_samples_genotypes.vcf -selectType SNP -o all_samples_genotypes.snps.vcf
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T VariantFiltration -R reference.fna -V all_samples_genotypes.snps.vcf --clusterWindowSize 10 --clusterSize 3 --filterName \"SNPFiltering\" --filterExpression \"QD < 2.0 || FS > 60.0 || MQ < 40.0 || (vc.hasAttribute(\"MQRankSum\") && MQRankSum < -4.0) || (vc.hasAttribute(\"ReadPosRankSum\") && ReadPosRankSum < -2.0) || (vc.hasAttribute(\"BaseQRankSum\") && BaseQRankSum < -2.0) || (vc.hasAttribute(\"ClippingRankSum\") && ClippingRankSum < -2.0) || SOR > 4.0\" -o all_samples_genotypes.snps.filtered.vcf
+  
+#Select and filter indels:
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T SelectVariants -R reference.fna -V all_samples_genotypes.vcf -selectType INDEL -o all_samples_genotypes.indels.vcf
+java -Xmx2g -jar GATK3.7/GenomeAnalysisTK.jar -T VariantFiltration -R reference.fna -V all_samples_genotypes.indels.vcf --filterName \"INDELFiltering\" --filterExpression \"QD < 2.0 || FS > 200.0 || ReadPosRankSum < -10.0 || SOR > 4.0\" -o all_samples_genotypes.indels.filtered.vcf
+    
+#Now additional filtering can be performed on all_samples_genotypes.snps.filtered.vcf. These additional filterings were performed as detailed in the Methods section of the BIO-ML paper.  In particular, variants falling within potential recombination regions can be filtered out from the SNP vcf file/SNP table.  
+
+### Phylogenetic reconstructions, using RAxML (Maximum Likelihood) or DNAPARS (Maximum Parsimony): 
+#ML reconstruction with RAxML:
+raxmlHPC -s snps.filtered.fasta -m ASC_GTRGAMMA -p 12945 -n snps.filtered.tree --asc-corr=lewis
+
+#Parsimony reconstruction with DNAPARS:
+seaview -convert -output_format phylip -o snps.filtered.phy snps.filtered.fasta
+echo "snps.filtered.phy" > options.dnapars.txt
+echo "V" >> options.dnapars.txt
+echo "1" >> options.dnapars.txt
+echo "Y" >> options.dnapars.txt
+echo "5" >> options.dnapars.txt
+echo "Y" >> options.dnapars.txt
+echo "." >> options.dnapars.txt
+dnapars < options.dnapars.txt > output_dnapars
