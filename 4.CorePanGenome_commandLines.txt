@@ -1,0 +1,46 @@
+#############################################
+######### Core/Pan genome analysis ##########
+#############################################
+
+### We computed core and pan genomes with the program Roary for Bifodobacterium adolescentis and Bifidobacterium longum with the genomes from the BIO-ML, HBC, CGR and NCBI collections (see our manuscript).
+
+### Genome annotations, to produce GFF3 files. GFF3 is needed to run Roary (see Roary's manual)
+#We run prokka on each genome assembly:
+prokka --outdir Prokka_genome --prefix genome_prokka genome_assembly.fna
+
+#Let's consider all GFF3 files are in directory GffFiles. We now run Roary to compute core and pan genomes:
+singularity exec roary.img roary -p 8 -f Roary_results -e -n -i 70 -cd 95 -r -s GffFiles/*gff
+
+#Then we turn the presence/absence csv file produced by Roary into a gene count table using home-made script.
+
+#We also generated the phylogenetic trees of the these two species using the SNP calling command lines shown in file 3.SNPcalling_commandLines.txt. Let's consider the tree file name for B. adolescentis is b_adolescentis.tree
+
+#Now we use R to perform multivariate and genome clustering analyses from gene contents:
+
+library(vegan)
+library(ggplot2)
+library(ape)
+a=read.table("gene_counts_table.csv",sep='\t',row.names=1,h=T,check.names=F)
+a=t(a)
+#Dissimilarities between gene contents are calculated using the Bray-Curtis metric:
+braycurtis=vegdist(a,method="bray",correction="cailliez")
+#We calculate the PCoA:
+braycurtis_pcoa=pcoa(braycurtis)
+pcoa1=braycurtis_pcoa$vectors[,1]
+pcoa2=braycurtis_pcoa$vectors[,2]
+PCOA_table=data.frame(PCOA1 = pcoa1, PCOA2 = pcoa2)
+ggplot(PCOA_table, aes(x=PCOA1, y=PCOA2)) + geom_point(alpha = 6/10) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+
+library(phytools)
+#We reconstruct the tree of gene content, using a distance-based method (BIONJ):
+bionjtree=bionj(braydist)
+#We load the SNP tree:
+snptree=read.tree("b_adolescentis.tree")
+#We calculate the cophylogeny:
+obj=cophylo(snptree_rooted2,bionj_rooted2)
+plot(obj)
+
+
+
+ 
+  
